@@ -1,0 +1,1605 @@
+generator_headdir.py:
+
+import os
+import time
+import json
+import uuid
+import random
+import math
+import sys
+
+import torch
+from torch.utils.data import IterableDataset, Dataset
+from torch import nn
+from torch.nn import functional as f
+
+from torchvision.transforms import ToPILImage
+
+import numpy as np
+from pathlib import Path
+from rich.progress import Progress
+
+import MalmoPython
+import malmoutils
+from lxml import etree
+
+import networkx as nx
+from skimage.morphology import dilation
+
+
+torch.multiprocessing.set_sharing_strategy("file_system")
+
+malmoutils.fix_print()
+
+
+class EnvironmentGenerator(IterableDataset):
+    def __init__(
+        self, fn, port, batch_size=128, dataset_size=None, steps=50, tic_duration=0.008
+    ):
+        super().__init__()
+        self.tree = etree.parse(fn)
+        self.batch_size = batch_size
+        self.agent_host = MalmoPython.AgentHost()
+        self.dataset_size = dataset_size
+        self.current_samples = 0
+        self.steps = steps
+        self.tic_duration = tic_duration
+        self.tolerance = 0.001
+        self.render_tolerance = 0.4
+        self.heading_dir = 0
+        self.rng = np.random.default_rng()
+
+        # Load environment
+        self.env = MalmoPython.MissionSpec(etree.tostring(self.tree), True)
+
+        # Do not record anything
+        self.record = MalmoPython.MissionRecordSpec()
+
+        # Initialize client pool
+        pool = MalmoPython.ClientPool()
+        info = MalmoPython.ClientInfo("localhost", port)
+        pool.add(info)
+        experiment_id = str(uuid.uuid1())
+
+        # Initialize environment
+        self.agent_host.startMission(self.env, pool, self.record, 0, experiment_id)
+
+        # Loop until the mission starts
+        world_state = self.agent_host.getWorldState()
+        while not world_state.has_mission_begun:
+            time.sleep(0.1)
+            world_state = self.agent_host.getWorldState()
+
+        world_state = self.wait_initial_state()
+        frame = world_state.video_frames[-1]
+        self.HWC = (frame.height, frame.width, frame.channels)
+
+        #print(self.prev_x, self.prev_y, self.prev_z)
+
+        self.agent_host.sendCommand("tp 3.5 4.0 28.5")
+        self.expected_x = 3.5
+        self.expected_y = 4.0
+        self.expected_z = 28.5
+        self.expected_yaw = 0
+        self.require_yaw_change = True  # ?
+        self.require_move = True
+
+        time.sleep(0.1)
+        self.prev_state, error = self.wait_next_state()
+        #print("got first state")
+
+        self.path = self.generate_path()
+        self.hd_path = self.generate_hd_path()
+        self.start_time = time.time()
+        self.best_index = 0
+
+    def init_pathfinding(self):
+        # Get the grid
+        grid = [
+            block == "air"
+            for block in json.loads(self.prev_state.observations[-1].text)["board"]
+        ]
+        grid = ~np.array(grid).reshape((66, 41))
+        grid = np.flip(grid, axis=1)
+        grid = dilation(grid)
+
+        # Build the graph
+        G = nx.grid_graph(dim=grid.shape)
+
+        H, W = grid.shape
+
+        edges = []
+        for n in G.nodes:
+            if (
+                n[0] > 0
+                and n[1] > 0
+                and (~grid[n[1] - 1 : n[1] + 2, n[0] - 1 : n[0] + 2]).all()
+            ):
+                edges += [(n, (n[0] - 1, n[1] - 1))]
+                edges += [((n[0] - 1, n[1] - 1), n)]
+            if (
+                n[0] > 0
+                and n[1] < H - 1
+                and (~grid[n[1] - 1 : n[1] + 2, n[0] - 1 : n[0] + 2]).all()
+            ):
+                edges += [(n, (n[0] - 1, n[1] + 1))]
+                edges += [((n[0] - 1, n[1] + 1), n)]
+
+        G.add_edges_from(edges)
+
+        blocks = []
+        for n in G.nodes:
+            j, i = n
+            if grid[i, j]:
+                blocks += [n]
+
+        G.remove_nodes_from(blocks)
+        self.G = G
+
+    def find_path(self, goal):
+        x_i = self.curr_x
+        z_i = self.curr_z
+
+        i_i = z_i + 29.5
+        j_i = -x_i + 19.5
+
+        start = (j_i, i_i)
+
+        def dist(a, b):
+            (x1, y1) = a
+            (x2, y2) = b
+            return ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
+
+        path = nx.astar_path(self.G, start, goal, heuristic=dist, weight="cost")
+        path = [(-j + 19.5, i - 29.5) for j, i in path]
+        path = np.array(list(zip(*path)))
+
+        return path
+    
+
+    def follow_path(self, path, alpha=1, beta=0.6):
+        x = self.curr_x
+        z = self.curr_z
+        direction = self.heading_dir
+        curr_yaw = self.curr_yaw
+
+        distance = np.sqrt((path[0, :] - x) ** 2 + (path[1, :] - z) ** 2)
+        goal_index = np.argmin(distance) + 1
+
+        if goal_index >= len(distance):
+            self.path = self.generate_path()
+            self.hd_path = self.generate_hd_path()
+            self.best_index = 0
+            self.start_time = time.time()
+
+            return None, False
+        
+        if goal_index > self.best_index:
+            self.start_time = time.time()
+            self.best_index = goal_index
+
+        ntics = (time.time() - self.start_time) / self.tic_duration
+        if ntics > 600000:  # why 240?
+            #print("time diff too much", time.time() - self.start_time)
+            self.agent_host.sendCommand("tp 3.5 4.0 28.5")
+            self.agent_host.sendCommand("setYaw 0")
+            self.expected_x = 3.5
+            self.expected_y = 4.0
+            self.expected_z = 28.5
+            self.expected_yaw = 0
+            self.require_yaw_change = self.curr_yaw != 0
+            self.require_move = self.curr_x != 3.5 or self.curr_z != 28.5
+            self.prev_state, error = self.wait_next_state()
+            self.path = self.generate_path()
+            self.hd_path = self.generate_hd_path()
+            self.best_index = 0
+            self.start_time = time.time()
+
+            return None, True
+
+        goal = path[:, goal_index]
+        hd_goal = self.hd_path[:, goal_index]
+
+        def get_angle(x, z):
+            return np.arctan2(-x, z) / np.pi * 180
+
+        target_direction = get_angle(goal[0] - x, goal[1] - z)
+        target_hd_dir = get_angle(hd_goal[0] - x, goal[1] - z)
+
+        angle_diff = np.mod(target_direction, 360) - np.mod(direction, 360)
+        angle_hd_diff = np.mod(target_hd_dir, 360) - np.mod(curr_yaw, 360)
+        
+        while np.abs(angle_diff) > 180:
+            if angle_diff > 180:
+                angle_diff += -360
+            else:
+                angle_diff += 360
+                
+        while np.abs(angle_hd_diff) > 180:
+            if angle_hd_diff > 180:
+                angle_hd_diff += -360
+            else:
+                angle_hd_diff += 360
+
+        ang_vel = alpha * angle_diff / 180
+        ang_hd_vel = alpha * angle_hd_diff / 180
+        speed = beta * np.clip((1 - ang_vel) * distance[goal_index] * 0.3, 0, 1)
+
+        velocity = {"speed": speed, "ang_vel": ang_vel, "ang_hd_vel": ang_hd_vel}
+
+        return velocity, False
+
+    def generate_path(self):
+        x_i = self.curr_x
+        z_i = self.curr_z
+        direction = self.curr_yaw
+
+        i_i = z_i + 29.5
+        j_i = -x_i + 19.5
+
+        start = (int(j_i), int(i_i))
+
+        if not start in self.G.nodes:
+            self.agent_host.sendCommand("tp 3.5 4.0 28.5")
+            self.agent_host.sendCommand("setYaw 0")
+            time.sleep(0.1)
+            self.expected_x = 3.5
+            self.expected_y = 4.0
+            self.expected_z = 28.5
+            self.expected_yaw = 0
+            self.require_yaw_change = self.curr_yaw != 0
+            self.require_move = self.curr_x != 3.5 or self.curr_z != 28.5
+            self.prev_state, error = self.wait_next_state()
+
+            x_i = self.curr_x
+            z_i = self.curr_y
+            direction = self.curr_yaw
+
+            i_i = z_i + 29.5
+            j_i = -x_i + 19.5
+
+            start = (int(j_i), int(i_i))
+
+        def dist(a, b):
+            (x1, y1) = a
+            (x2, y2) = b
+            return ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
+
+        while True:
+            goal = (np.random.randint(0, 41), np.random.randint(0, 65))
+            try:
+                path_ji = nx.astar_path(
+                    self.G, start, goal, heuristic=dist, weight="cost"
+                )
+            except (nx.exception.NetworkXNoPath, nx.exception.NodeNotFound) as e:
+                continue
+            break
+        path = [(-j + 19.5, i - 29.5) for j, i in path_ji]  # (z, x)
+        path = np.array(list(zip(*path)))
+
+        return path
+    
+    def generate_hd_path(self):
+        hd_path = np.copy(self.path)
+        sign = np.random.choice([-1, 1], size=hd_path.shape)
+        return hd_path + sign * self.rng.normal(1,1,size=hd_path.shape)
+
+    # examining visual content/object content etc in the earlier conv layers
+    # autoencoder lateral part of entorhinal cortex, dorsal is path integration
+    # also taking a look at encoding of proximity to objects versus if the objects are within view
+    # similarity to cscg
+    # cory at ucsd
+    # gaze-positioning paper in nature
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        # Initialize array with max sequence length
+        #print("next")
+        H, W, C = self.HWC
+        L = self.steps
+        inputs = np.empty((L, H, W, C), dtype=np.uint8)
+        actions = np.empty((L, 3), np.float32)
+        state = np.empty((L, 3), dtype=np.float32)
+
+        for idx in range(L):
+            ##print(idx)
+
+            def btoa(pixels):
+                return np.reshape(np.frombuffer(pixels, dtype=np.uint8), self.HWC)
+
+            # Fill batch
+            pixels = self.prev_state.video_frames[-1].pixels
+            inputs[idx] = btoa(pixels).copy()
+
+            x_i = self.curr_x
+            z_i = self.curr_z
+            direction = self.curr_yaw
+
+            i_i = z_i + 29.5
+            j_i = -x_i + 19.5
+
+            start = (int(j_i), int(i_i))
+
+            state[idx] = np.array([x_i, z_i, direction], dtype=np.float32)
+
+            velocity, stuck = self.follow_path(self.path)
+            if not velocity:
+                if stuck:
+                    print("stuck")
+                    # return (inputs, actions, state)
+                    return None
+
+                # check if position is feasible
+                if not self.G.has_node(start):
+                    #print("no start in next")
+                    self.agent_host.sendCommand("tp 3.5 4.0 28.5")
+                    self.agent_host.sendCommand("setYaw 0")
+                    time.sleep(0.1)
+                    self.expected_x = 3.5
+                    self.expected_y = 4.0
+                    self.expected_z = 28.5
+                    self.expected_yaw = 0
+                    self.require_yaw_change = self.curr_yaw != 0
+                    self.require_move = self.curr_x != 3.5 or self.curr_z != 28.5
+                    self.prev_state, error = self.wait_next_state()
+                    if error:
+                        return None
+                self.path = self.generate_path()
+                self.hd_path = self.generate_hd_path()
+                self.start_time = time.time()
+                self.best_index = 0
+                velocity, stuck = self.follow_path(self.path)
+
+            speed = velocity["speed"]
+            ang_vel = velocity["ang_vel"]
+            ang_hd_vel = velocity["ang_hd_vel"]
+            actions[idx] = [speed, ang_vel, ang_hd_vel]
+
+            #print(f"speed and ang vel {speed:.3f} {ang_vel:.3f}")
+
+            DEG_TO_RAD = math.pi / 180
+            x, z, yaw = list(state[idx])
+
+            #print(f"current pos {x:.3f} {z:.3f} {yaw:.3f}")
+
+            moderated_ang_vel = ang_vel * 0.2
+            moderated_ang_hd_vel = ang_hd_vel * 0.2
+            moderated_speed = speed * 0.9
+
+            heading_change = math.pi * (moderated_ang_vel + self.heading_dir / 180)
+
+            new_x = x - moderated_speed * math.sin(heading_change)
+            new_z = z + moderated_speed * math.cos(heading_change)
+
+            self.heading_dir = (moderated_ang_vel * 180) + self.heading_dir
+            new_yaw = (moderated_ang_hd_vel * 180) + yaw
+            
+            self.agent_host.sendCommand(f"tp {new_x} 4.0 {new_z}")
+            self.agent_host.sendCommand(f"setYaw {new_yaw}")
+            time.sleep(0.12)
+
+            self.expected_x = new_x
+            self.expected_y = 4.0
+            self.expected_z = new_z
+            self.expected_yaw = math.fmod(new_yaw, 360)
+            self.require_yaw_change = new_yaw != yaw
+            self.require_move = new_x != x or new_z != z
+
+            self.prev_state, error = self.wait_next_state()
+            if error:
+                return None
+
+        return (inputs, actions, state)
+
+    def generate_dataset(self, path: Path, size=1000):
+        current_size = 0
+        with Progress() as progress:
+            task = progress.add_task("Building dataset...", total=size)
+            while current_size < size:
+                batch = self.__next__()
+                if batch is None:
+                    continue
+                inputs, actions, state = batch
+                current_path = path / f"{time.time()}"
+                os.makedirs(current_path, exist_ok=True)
+                for t in range(len(inputs)):
+                    image = ToPILImage()(inputs[t])
+                    image.save(current_path / f"{t}.png")
+                np.savez(current_path / "actions.npz", actions)
+                np.savez(current_path / "state.npz", state)
+
+                current_size += self.steps
+                progress.update(task, advance=self.steps)
+
+    # turn waiting from malmo python examples
+    def wait_initial_state(self):
+        """Before a command has been sent we wait for an observation of the world and a frame."""
+        # wait for a valid observation
+        world_state = self.agent_host.peekWorldState()
+        while world_state.is_mission_running and all(
+            e.text == "{}" for e in world_state.observations
+        ):
+            world_state = self.agent_host.peekWorldState()
+        # wait for a frame to arrive after that
+        num_frames_seen = world_state.number_of_video_frames_since_last_state
+        while (
+            world_state.is_mission_running
+            and world_state.number_of_video_frames_since_last_state == num_frames_seen
+        ):
+            world_state = self.agent_host.peekWorldState()
+        world_state = self.agent_host.getWorldState()
+
+        if world_state.is_mission_running:
+
+            assert len(world_state.video_frames) > 0, "No video frames!?"
+
+            obs = json.loads(world_state.observations[-1].text)
+            self.prev_x = obs["XPos"]
+            self.prev_y = obs["YPos"]
+            self.prev_z = obs["ZPos"]
+            self.prev_yaw = obs["Yaw"]
+            self.prev_dir = (
+                self.prev_yaw
+            )  # the direction of movement and yaw are detangled
+            #print(
+            #    "Initial position:",
+            #    self.prev_x,
+            #    ",",
+            #    self.prev_y,
+            #    ",",
+            #    self.prev_z,
+            #    "yaw",
+            #    self.prev_yaw,
+            #)
+
+            self.prev_state = world_state
+            self.init_pathfinding()
+
+        return world_state
+
+    def wait_next_state(self):
+        """After each command has been sent we wait for the observation to change as expected and a frame."""
+        # wait for the observation position to have changed
+        #print("Waiting for observation...", end=" ")
+        obs = None
+        wait = 0
+        while wait < 10000000:
+            wait += 1
+            world_state = self.agent_host.peekWorldState()
+            if not world_state.is_mission_running:
+                #print("mission ended.")
+                break
+            if not all(e.text == "{}" for e in world_state.observations):
+                obs = json.loads(world_state.observations[-1].text)
+                self.curr_x = obs["XPos"]
+                self.curr_y = obs["YPos"]
+                self.curr_z = obs["ZPos"]
+                self.curr_yaw = math.fmod(obs["Yaw"], 360)
+                if self.require_move:
+                    if (
+                        math.fabs(self.curr_x - self.prev_x) > self.tolerance
+                        or math.fabs(self.curr_y - self.prev_y) > self.tolerance
+                        or math.fabs(self.curr_z - self.prev_z) > self.tolerance
+                    ):
+                        break
+                elif self.require_yaw_change:
+                    if math.fabs(self.curr_yaw - self.prev_yaw) > self.tolerance:
+                        break
+                else:
+                    break
+
+        if wait == 10000000:
+            print("hung waiting for obs")
+            return world_state, True
+        # wait for the render position to have changed
+        #print("Waiting for render...", end=" ")
+        
+        wait = 0
+        while wait < 10000000:
+            world_state = self.agent_host.peekWorldState()
+            if not world_state.is_mission_running:
+                #print("mission ended.")
+                break
+            if len(world_state.video_frames) > 0:
+                # #print('render changed')
+                frame = world_state.video_frames[-1]
+                curr_x_from_render = frame.xPos
+                curr_y_from_render = frame.yPos
+                curr_z_from_render = frame.zPos
+                curr_yaw_from_render = math.fmod(frame.yaw, 360)
+                if self.require_move:
+                    # #print('render move required')
+                    if (
+                        math.fabs(curr_x_from_render - self.prev_x) > self.tolerance
+                        or math.fabs(curr_y_from_render - self.prev_y) > self.tolerance
+                        or math.fabs(curr_z_from_render - self.prev_z) > self.tolerance
+                    ):
+                        #   #print('render received a move.')
+
+                        break
+                elif self.require_yaw_change:
+                    if math.fabs(curr_yaw_from_render - self.prev_yaw) > self.tolerance:
+                        #  #print('render received a turn.')
+                        break
+                else:
+                    # #print('render received.')
+                    break
+
+        if wait == 10000000:
+            print("hung waiting for render")
+            return world_state, True            
+                    
+        num_frames_before_get = len(world_state.video_frames)
+        world_state = self.agent_host.getWorldState()
+
+        if world_state.is_mission_running:
+            assert len(world_state.video_frames) > 0, "No video frames!?"
+            num_frames_after_get = len(world_state.video_frames)
+            assert (
+                num_frames_after_get >= num_frames_before_get
+            ), "Fewer frames after getWorldState!?"
+            frame = world_state.video_frames[-1]
+            # obs = json.loads( world_state.observations[-1].text )
+            self.curr_x = obs["XPos"]
+            self.curr_y = obs["YPos"]
+            self.curr_z = obs["ZPos"]
+            self.curr_yaw = math.fmod(
+                obs["Yaw"], 360
+            )  # math.fmod(180 + obs[u'Yaw'], 360)
+            #print(
+            #    "1 New position from observation:",
+            #    self.curr_x,
+            #    ",",
+            #    self.curr_y,
+            #    ",",
+            #    self.curr_z,
+            #    "yaw",
+            #    self.curr_yaw,
+            #    end=" ",
+            #)
+            if (
+                math.fabs(self.curr_x - self.expected_x) > self.render_tolerance
+                or math.fabs(self.curr_y - self.expected_y) > self.render_tolerance
+                or math.fabs(self.curr_z - self.expected_z) > self.render_tolerance
+                or math.fabs(self.curr_yaw - self.expected_yaw) > self.render_tolerance
+            ):
+                print(
+                    " - ERROR DETECTED! Expected:",
+                    self.expected_x,
+                    ",",
+                    self.expected_y,
+                    ",",
+                    self.expected_z,
+                    "yaw",
+                    self.expected_yaw,
+                )
+                print(self.curr_x, self.curr_y, self.curr_z, self.curr_yaw)
+                 #sys.exit("expected vs curr issue")
+                return world_state, True
+            else:
+                pass
+            #   #print('as expected.')
+            curr_x_from_render = frame.xPos
+            curr_y_from_render = frame.yPos
+            curr_z_from_render = frame.zPos
+            # #print('rendered yaw', frame.yaw)
+            curr_yaw_from_render = math.fmod(
+                frame.yaw, 360
+            )  # math.fmod(180 + frame.yaw ,360)
+            #print(
+            #    "New position from render:",
+            #    curr_x_from_render,
+            #    ",",
+            #    curr_y_from_render,
+            #    ",",
+            #    curr_z_from_render,
+            #    "yaw",
+            #    curr_yaw_from_render,
+            #)
+            if (
+                math.fabs(curr_x_from_render - self.expected_x) > self.render_tolerance
+                or math.fabs(curr_y_from_render - self.expected_y)
+                > self.render_tolerance
+                or math.fabs(curr_z_from_render - self.expected_z)
+                > self.render_tolerance
+                or math.fabs(curr_yaw_from_render - self.expected_yaw)
+                > self.render_tolerance
+            ):
+                print(
+                    " - ERROR DETECTED! Expected:",
+                    self.expected_x,
+                    ",",
+                    self.expected_y,
+                    ",",
+                    self.expected_z,
+                    "yaw",
+                    self.expected_yaw,
+                )
+                print(self.curr_x, self.curr_y, self.curr_z, self.curr_yaw)
+                
+                # sys.exit("curr vs render issue")
+                return world_state, True
+            else:
+                pass
+            #   #print('as expected.')
+            self.prev_x = self.curr_x
+            self.prev_y = self.curr_y
+            self.prev_z = self.curr_z
+            self.prev_yaw = self.curr_yaw
+
+        return world_state, False
+
+generator_pc.py:
+
+def parse_boundaries(env_tree):
+    """
+    Parse the environment XML to grab the boundaries.
+    Args:
+    - env_tree: XML tree
+    """
+    ns = {'ns': 'http://ProjectMalmo.microsoft.com'}
+
+    min_element = env_tree.find('.//ns:min', ns)
+    max_element = env_tree.find('.//ns:max', ns)
+
+    if min_element is not None and max_element is not None:
+        min_coords = {
+            'x': float(min_element.attrib['x']),
+            'z': float(min_element.attrib['z'])
+        }
+        max_coords = {
+            'x': float(max_element.attrib['x']),
+            'z': float(max_element.attrib['z'])
+        }
+        return min_coords, max_coords
+    else:
+        raise ValueError("Could not find min or max elements in the XML.")
+
+
+class EnvironmentGenerator(IterableDataset):
+    def __init__(self, fn, port, tic_duration=0.008, rotations=17):
+        """
+        Set up a Malmo testing environment according to specs.
+        This agent collects observations at each indicated direction in every 
+        valid spot in the environment.
+        Args:
+        - fn: which mission to run
+        - port: which port to contact the Minecraft server on
+        - tic_duration: tic duration for the server (leave alone)
+        - rotations: number of observations collected, evenly spaced along 360 degrees 
+        """
+        super().__init__()
+
+        self.tree = etree.parse(fn)
+        self.agent_host = MalmoPython.AgentHost()
+        self.tic_duration = tic_duration
+        self.rotations = rotations
+
+        self.threshold = 0.001    # Changes in state above this are recorded
+        self.render_tolerance = 0.05  # Allowed diff between render and recorded state
+        self.visited = set()      # Locations visited so far
+
+        # Load environment
+        self.env = MalmoPython.MissionSpec(etree.tostring(self.tree), True)
+
+        # Do not record anything
+        self.record = MalmoPython.MissionRecordSpec()
+
+        # Initialize client pool
+        pool = MalmoPython.ClientPool()
+        info = MalmoPython.ClientInfo("localhost", port)
+        pool.add(info)
+        experiment_id = str(uuid.uuid1())
+
+        # Initialize environment
+        self.agent_host.startMission(self.env, pool, self.record, 0, experiment_id)
+
+        # Loop until the mission starts
+        world_state = self.agent_host.getWorldState()
+        while not world_state.has_mission_begun:
+            time.sleep(0.1)
+            world_state = self.agent_host.getWorldState()
+
+        time.sleep(5)
+        world_state = self.wait_initial_state()
+        frame = world_state.video_frames[-1]
+        self.HWC = (frame.height, frame.width, frame.channels)
+
+        self.locs = []
+
+        min_bounds, max_bounds = parse_boundaries(self.tree)
+
+        # Ensure integer bounds for range function
+        min_x = int(math.floor(min_bounds['x']))
+        max_x = int(math.ceil(max_bounds['x']))
+        min_z = int(math.floor(min_bounds['z']))
+        max_z = int(math.ceil(max_bounds['z']))
+
+        self.locs.append(f'{min_x + 0.5}_{min_z + 0.5}')
+        print(self.locs)
+
+        #for x in range(min_x, max_x + 1):
+        #    for z in range(min_z, max_z + 1):
+        #        self.locs.append(f'{x + 0.5}_{z + 0.5}')
+
+        self.start_time = time.time()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        H, W, C = self.HWC
+        inputs = np.empty((self.rotations, H, W, C), dtype=np.uint8)
+
+        state = []
+        actions = []
+
+        if len(self.locs) > 0:
+            loc = self.locs.pop(0).split('_')
+            x = float(loc[0])
+            z = float(loc[1])
+        else:
+            raise StopIteration
+
+        base_x, base_z = x, z
+        yaw = prev_yaw = 0
+
+        self.curr_loc = (base_x, base_z, yaw)
+
+        for idx in range(self.rotations):
+            print(idx)
+            def btoa(pixels):
+                return np.reshape(np.frombuffer(pixels, dtype=np.uint8), self.HWC)
+
+            self.agent_host.sendCommand(f"tp {x} 4.0 {z}")
+            self.agent_host.sendCommand(f"setYaw {yaw}")
+            time.sleep(1.7)  # Arbitrary, but this works best
+
+            self.expected_x = x
+            self.expected_y = 4.0  # Prevent placement in water or on top of a fence
+            self.expected_z = z
+            self.expected_yaw = yaw
+
+            self.require_yaw_change = yaw != getattr(self, 'curr_yaw', yaw)
+            self.require_move = x != getattr(self, 'curr_x', x) or z != getattr(self, 'curr_z', z)
+
+            self.prev_state, error = self.wait_next_state()
+            if error or not self.prev_state.video_frames:
+                print(error)
+                raise RuntimeError("Error in wait_next_state")
+
+            pixels = self.prev_state.video_frames[-1].pixels
+
+            inputs[idx] = btoa(pixels).copy()
+
+            state.append((self.curr_x_from_render, self.curr_z_from_render, self.curr_yaw_from_render))
+
+            step = np.random.uniform(-0.03, 0.03, size=2)  # Add a little noise to the position
+
+            actions.append((step[0], step[1], prev_yaw - yaw))
+
+            x, z = base_x + step[0], base_z + step[1]
+            prev_yaw = yaw
+            yaw = (idx + 1) * (360 / self.rotations)
+            yaw %= 360
+
+        state = np.array(state)
+        actions = np.array(actions)
+
+        return inputs, actions, state
+
+    def generate_dataset(self, path: Path):
+        # Can get stuck sometimes, set up a timeout handler
+        def handler(signum, frame):
+            raise TimeoutError()
+
+        signal.signal(signal.SIGALRM, handler)
+
+        # Clean up any partially-filled directories
+        print("Checking for completed coordinates")
+        orig_size = len(self.locs)
+        for item in os.listdir(path):
+            item_path = os.path.join(path, item)
+            if os.path.isdir(item_path):
+                if f'{self.rotations - 1}.png' in os.listdir(item_path):
+                    coord = item
+                    if coord in self.locs:
+                        self.locs.remove(coord)
+                else:
+                    print(f"Deleting the partial {item}")
+                    shutil.rmtree(item_path)
+
+        print(f"{len(self.locs)} / {orig_size} left to generate")
+
+        print("Building dataset")
+
+        with Progress() as progress:
+            task = progress.add_task("Building dataset...", total=len(self.locs))
+
+            while len(self.locs) > 0:
+                try:
+                    signal.alarm(100)
+                    batch = self.__next__()
+                    signal.alarm(0)
+                except TimeoutError:
+                    print(f"Timeout on {self.curr_loc}")
+                    continue
+                except StopIteration:
+                    print("Finished")
+                    return
+                except Exception as e:
+                    print(f"Exception: {e}")
+                    continue
+
+                inputs, actions, state = batch
+                current_path = path / f"{state[0, 0]}_{state[0, 1]}"
+
+                try:
+                    os.makedirs(current_path, exist_ok=False)
+                except FileExistsError:
+                    continue
+
+                for t in range(len(inputs)):
+                    image = ToPILImage()(inputs[t])
+                    image.save(current_path / f"{t}.png")
+
+                np.savez(current_path / "actions.npz", actions)
+                np.savez(current_path / "state.npz", state)
+
+                progress.update(task, advance=1)
+
+generate_random_even_spacing.py:
+
+class EnvironmentGenerator(IterableDataset):
+    def __init__(
+        self, fn, port, batch_size=128, dataset_size=None, steps=50, tic_duration=0.008, momentum_coeff=0.1, dir_inertia_coeff=0.1
+    ):
+        super().__init__()
+        self.tree = etree.parse(fn)
+        self.batch_size = batch_size
+        self.agent_host = MalmoPython.AgentHost()
+        self.dataset_size = dataset_size
+        self.current_samples = 0
+        self.steps = steps
+        self.tic_duration = tic_duration
+        self.tolerance = 0.001
+        self.render_tolerance = 0.05
+        self.border_region = 0.5 #25
+        self.momentum_coeff = momentum_coeff
+        self.dir_inertia_coeff = dir_inertia_coeff
+
+        # Load environment
+        self.env = MalmoPython.MissionSpec(etree.tostring(self.tree), True)
+
+        # Do not record anything
+        self.record = MalmoPython.MissionRecordSpec()
+
+        # Initialize client pool
+        pool = MalmoPython.ClientPool()
+        info = MalmoPython.ClientInfo("localhost", port)
+        pool.add(info)
+        experiment_id = str(uuid.uuid1())
+
+        # Initialize environment
+        self.agent_host.startMission(self.env, pool, self.record, 0, experiment_id)
+
+        # Loop until the mission starts
+        world_state = self.agent_host.getWorldState()
+        while not world_state.has_mission_begun:
+            time.sleep(0.1)
+            world_state = self.agent_host.getWorldState()
+
+        world_state = self.wait_initial_state()
+        frame = world_state.video_frames[-1]
+        self.HWC = (frame.height, frame.width, frame.channels)
+
+        self.start_time = time.time()
+
+    def init_pathfinding(self):
+        grid = [
+            block == "air"
+            for block in json.loads(self.prev_state.observations[-1].text)["board"]
+        ]
+        grid = ~np.array(grid).reshape((66, 41))
+        grid = np.flip(grid, axis=1)
+        
+        self.grid = grid
+        
+        # Collect all of the positions of obstacles in the env
+        obstacle_locs = []
+        
+        for i in range(66):
+            for j in range(41):
+                if grid[i, j]:
+                    obstacle_locs.append((-j + 19.5, i - 29.5))
+
+        for z in [-30, 35]:
+            for x in range(-20, 20):
+                obstacle_locs.append((x, z))
+        
+        for x in [-20, 20]:
+            for z in range(-30, 35):
+                obstacle_locs.append((x, z))
+                
+        self.obstacle_locs = set(obstacle_locs)
+
+    
+    def get_nearest_obstacle(self, position):
+        '''
+        Find closest obstacle to the current position
+        '''
+        
+        min_dist = float('inf')
+        min_obst = None
+        for obst in self.obstacle_locs:
+            obst = np.array(obst, dtype=np.float32)
+            d = np.linalg.norm(position-obst)
+            if d < min_dist:
+                min_dist = d
+                min_obst = obst
+          
+        return min_obst, min_dist
+
+    
+    def avoid_obstacles(self, position, move_dir):
+        '''
+        Compute distance and angle to nearest obstacle/boundary
+        '''
+        x, z = position
+        
+        obst, d_obst = self.get_nearest_obstacle(position)
+        
+        def get_angle(x, z):
+            return np.arctan2(-x, z)
+        
+        a_obst = get_angle(obst[0] - x, obst[1] - z)
+        a_obst = np.mod(a_obst - move_dir + np.pi, 2*np.pi) - np.pi
+
+        is_near_obst = (d_obst < self.border_region)*(np.abs(a_obst) < np.pi/2)
+        turn_angle = np.zeros_like(move_dir)
+        turn_angle[is_near_obst] = -np.sign(a_obst) * np.pi / 4 * (1 - d_obst / self.border_region)
+        return is_near_obst, turn_angle
+
+    def generate_path(self, momentum_coeff=None, dir_inertia_coeff=None):
+        
+        if not momentum_coeff:
+            momentum_coeff = self.momentum_coeff
+        if not dir_inertia_coeff:
+            dir_inertia_coeff = self.dir_inertia_coeff
+        
+        dt = 0.3  # time step increment (seconds)
+        sigma = 1.76 * 3 * momentum_coeff  # stdev rotation velocity (rads/sec)
+        b = 0.23 * 1 * np.pi * dir_inertia_coeff # forward velocity rayleigh dist scale (m/sec)
+        
+        num_samples = self.steps
+        
+        # Find initial positions
+        position = np.zeros([num_samples+2, 2]).astype(np.float32)
+        move_dir = np.zeros([num_samples+2]).astype(np.float32)
+        yaw = np.zeros([num_samples+2]).astype(np.float32)
+
+        locs = ["112.5_197.5", "112.5_211.5", "112.5_214.5", "113.5_212.5", "113.5_221.5", "114.5_200.5", "115.5_217.5", "116.5_208.5", "117.5_215.5", "117.5_216.5", "118.5_214.5", "118.5_220.5", "119.5_201.5", "119.5_220.5", "120.5_210.5", "120.5_218.5", "122.5_199.5", "123.5_210.5", "126.5_203.5", "126.5_206.5", "126.5_209.5", "126.5_219.5", "127.5_206.5", "127.5_210.5", "129.5_219.5", "130.5_198.5", "132.5_202.5", "132.5_216.5", "133.5_202.5", "134.5_221.5", "135.5_201.5"]
+        
+        idx = np.random.randint(0, len(locs))
+        pos = locs[idx].split('_')
+        
+        position[0, 0] = float(pos[0])
+        position[0, 1] = float(pos[1])
+        move_dir[0] = np.random.uniform(0, 2*np.pi, 1).astype(np.float32)
+        yaw[0] = 0
+        velocity = np.zeros([num_samples+2]).astype(np.float32)
+        ang_v = np.zeros([num_samples+2]).astype(np.float32)
+
+        # Generate sequence of random boosts and turns
+        random_turn = np.random.normal(0, sigma, [num_samples+1]).astype(np.float32)
+        random_vel = np.random.normal(0, b, [num_samples+1]).astype(np.float32)
+        random_vel = np.abs(random_vel)
+        v = np.abs(np.random.normal(0, b*np.pi/2, 1)).astype(np.float32)
+
+        for t in range(num_samples + 1):
+            v = 0.7 + random_vel[t]
+            turn_angle = 0
+            
+            is_near_obst, turn_angle = self.avoid_obstacles(position[t], move_dir[t])
+            
+            if is_near_obst:
+                v *= 0.45 
+            
+            turn_angle += dt*random_turn[t]
+            
+            # Take a step
+            velocity[t] = v*dt
+            update = velocity[t]*np.stack([-np.sin(move_dir[t]), np.cos(move_dir[t])], axis=-1)
+            position[t+1] = position[t] + update
+                    
+            move_dir[t+1] = move_dir[t] + turn_angle
+            
+            yaw[t+1] = math.fmod(move_dir[t] / np.pi * 180, 360) # move yaw to end
+        
+        move_dir = np.mod(move_dir + np.pi, 2*np.pi) - np.pi
+        ang_v = np.diff(move_dir, axis=-1)
+        
+        return velocity[:num_samples], ang_v[:num_samples], position[:num_samples], move_dir[:num_samples], yaw[:num_samples]
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        H, W, C = self.HWC
+        L = self.steps
+        inputs = np.empty((L, H, W, C), dtype=np.uint8)
+ 
+        speed, ang_vel, position, move_dir, yaw = self.generate_path()
+    
+        move_dir = np.expand_dims(move_dir, axis=-1)
+        actions = np.column_stack((speed, ang_vel))
+        state = []
+        
+        for idx in range(L):
+            def btoa(pixels):
+                return np.reshape(np.frombuffer(pixels, dtype=np.uint8), self.HWC)
+
+            new_x, new_z = position[idx]
+            new_yaw = yaw[idx]
+            
+            self.agent_host.sendCommand(f"tp {new_x} 4.0 {new_z}")
+            self.agent_host.sendCommand(f"setYaw 0")
+            
+            time.sleep(0.06)
+
+            self.expected_x = new_x
+            self.expected_y = 4.0
+            self.expected_z = new_z
+            self.expected_yaw = 0
+            self.require_yaw_change = False
+            self.require_move = new_x != self.curr_x or new_z != self.curr_z
+            
+            self.prev_state, error = self.wait_next_state()
+            if error:
+                return None
+            
+            # Fill batch
+            if not self.prev_state.video_frames:
+                return None
+            pixels = self.prev_state.video_frames[-1].pixels
+            
+            state.append((self.curr_x_from_render, self.curr_z_from_render, self.curr_yaw_from_render))
+
+            inputs[idx] = btoa(pixels).copy()
+        
+        state = np.stack(state)
+        
+        return (inputs, actions, state)
+
+    def generate_dataset(self, path: Path, size=1000):
+        current_size = 0
+        with Progress() as progress:
+            task = progress.add_task("Building dataset...", total=size)
+            while current_size < size:
+                batch = self.__next__()
+                if batch is None:
+                    continue
+                inputs, actions, state = batch
+                current_path = path / f"{time.time()}"
+                os.makedirs(current_path, exist_ok=True)
+                for t in range(len(inputs)):
+                    image = ToPILImage()(inputs[t])
+                    image.save(current_path / f"{t}.png")
+                np.savez(current_path / "actions.npz", actions)
+                np.savez(current_path / "state.npz", state)
+
+                current_size += self.steps
+                progress.update(task, advance=self.steps)
+
+generate_random_headdir.py:
+
+class EnvironmentGenerator(IterableDataset):
+    def __init__(
+        self, fn, port, batch_size=128, dataset_size=None, steps=50, tic_duration=0.008, momentum_coeff=0.1, dir_inertia_coeff=0.1, head_coeff=0.0
+    ):
+        super().__init__()
+        self.tree = etree.parse(fn)
+        self.batch_size = batch_size
+        self.agent_host = MalmoPython.AgentHost()
+        self.dataset_size = dataset_size
+        self.current_samples = 0
+        self.steps = steps
+        self.tic_duration = tic_duration
+        self.tolerance = 0.001
+        self.render_tolerance = 0.1
+        self.border_region = 3 #25
+        self.momentum_coeff = momentum_coeff
+        self.dir_inertia_coeff = dir_inertia_coeff
+        self.head_coeff = head_coeff
+
+        # Load environment
+        self.env = MalmoPython.MissionSpec(etree.tostring(self.tree), True)
+
+        # Do not record anything
+        self.record = MalmoPython.MissionRecordSpec()
+
+        # Initialize client pool
+        pool = MalmoPython.ClientPool()
+        info = MalmoPython.ClientInfo("localhost", port)
+        pool.add(info)
+        experiment_id = str(uuid.uuid1())
+
+        # Initialize environment
+        self.agent_host.startMission(self.env, pool, self.record, 0, experiment_id)
+
+        # Loop until the mission starts
+        world_state = self.agent_host.getWorldState()
+        while not world_state.has_mission_begun:
+            time.sleep(0.1)
+            world_state = self.agent_host.getWorldState()
+
+        world_state = self.wait_initial_state()
+        frame = world_state.video_frames[-1]
+        self.HWC = (frame.height, frame.width, frame.channels)
+
+        self.start_time = time.time()
+
+    def init_pathfinding(self):
+        grid = [
+            block == "air"
+            for block in json.loads(self.prev_state.observations[-1].text)["board"]
+        ]
+        grid = ~np.array(grid).reshape((66, 41))
+        grid = np.flip(grid, axis=1)
+        #grid = dilation(grid) # need to think if you wanna do this at all
+        
+        self.grid = grid
+        
+        # Collect all of the positions of obstacles in the env
+        obstacle_locs = []
+        
+        for i in range(66):
+            for j in range(41):
+                if grid[i, j]:
+                    obstacle_locs.append((-j + 19.5, i - 29.5))
+
+        for z in [-30, 35]:
+            for x in range(-20, 20):
+                obstacle_locs.append((x, z))
+        
+        for x in [-20, 20]:
+            for z in range(-30, 35):
+                obstacle_locs.append((x, z))
+                
+        self.obstacle_locs = set(obstacle_locs)
+
+    
+    def get_nearest_obstacle(self, position):
+        '''
+        Find closest obstacle to the current position
+        '''
+        
+        min_dist = float('inf')
+        min_obst = None
+        for obst in self.obstacle_locs:
+            obst = np.array(obst, dtype=np.float32)
+            d = np.linalg.norm(position-obst)
+            if d < min_dist:
+                min_dist = d
+                min_obst = obst
+          
+        return min_obst, min_dist
+
+    
+    def avoid_obstacles(self, position, move_dir):
+        '''
+        Compute distance and angle to nearest obstacle/boundary
+        '''
+        x, z = position
+        
+        obst, d_obst = self.get_nearest_obstacle(position)
+        
+        def get_angle(x, z):
+            return np.arctan2(-x, z)
+        
+        a_obst = get_angle(obst[0] - x, obst[1] - z)
+        a_obst = np.mod(a_obst - move_dir + np.pi, 2*np.pi) - np.pi
+
+        is_near_obst = (d_obst < self.border_region)*(np.abs(a_obst) < np.pi/2)
+        turn_angle = np.zeros_like(move_dir)
+        turn_angle[is_near_obst] = -np.sign(a_obst) * np.pi / 4 * (1 - d_obst / self.border_region)
+        return is_near_obst, turn_angle
+
+    def generate_path(self, momentum_coeff=None, dir_inertia_coeff=None, head_coeff=None):
+        # higher coefficients mean more randomness, lower means it depends on the previous values more.
+
+        if not momentum_coeff:
+            momentum_coeff = self.momentum_coeff
+        if not dir_inertia_coeff:
+            dir_inertia_coeff = self.dir_inertia_coeff
+        if not head_coeff:
+            head_coeff = self.head_coeff
+
+        dt = 0.3  # time step increment (seconds)
+        sigma = 1.76 * 3 * momentum_coeff  # stdev rotation velocity (rads/sec)
+        sigma_hd = 1.76
+        b = 0.23 * 1 * np.pi * dir_inertia_coeff # forward velocity Rayleigh dist scale (m/sec)
+
+        num_samples = self.steps
+
+        # Find initial positions
+        position = np.zeros([num_samples+2, 2]).astype(np.float32)
+        move_dir = np.zeros([num_samples+2]).astype(np.float32)
+        head_dir = np.zeros([num_samples+2]).astype(np.float32)
+        yaw = np.zeros([num_samples+2]).astype(np.float32)
+
+        while True:
+            if np.random.randint(0,10) < 8:
+                j, i = np.random.randint(0, 41), np.random.randint(0, 43)
+            else:
+                j, i = np.random.randint(0, 41), np.random.randint(57, 65)
+            z = i - 29.5
+            x = -j + 19.5
+            if not self.grid[i, j]:
+                position[0, 0] = x
+                position[0, 1] = z
+                break
+
+        move_dir[0] = np.random.uniform(0, 2*np.pi, 1).astype(np.float32)
+        head_dir[0] = move_dir[0]  # Initialize head direction same as movement direction
+        yaw[0] = math.fmod(move_dir[0] / np.pi * 180, 360)
+        velocity = np.zeros([num_samples+2]).astype(np.float32)
+
+        # Generate sequence of random boosts and turns
+        random_turn = np.random.normal(0, sigma, [num_samples+1]).astype(np.float32)
+        random_look = np.random.normal(0, sigma_hd, [num_samples+1]).astype(np.float32)
+        random_vel = np.random.normal(0, b, [num_samples+1]).astype(np.float32)
+        random_vel = np.abs(random_vel)
+
+        for t in range(num_samples + 1):
+            v = 0.7 + random_vel[t]
+            turn_angle = 0
+
+            is_near_obst, turn_angle = self.avoid_obstacles(position[t], move_dir[t])
+
+            if is_near_obst:
+                v *= 0.45
+
+            turn_angle += dt * random_turn[t]
+            
+            swing_phase = (2*np.pi) * np.sin(2 * np.pi * t / num_samples)
+            look_angle = dt * (swing_phase * (1 - head_coeff) + head_coeff * random_look[t])
+
+            # Take a step
+            velocity[t] = v * dt
+            update = velocity[t] * np.stack([-np.sin(move_dir[t]), np.cos(move_dir[t])], axis=-1)
+            position[t+1] = position[t] + update
+
+            move_dir[t+1] = move_dir[t] + turn_angle
+            if head_coeff == None:
+                head_dir[t+1] = move_dir[t+1]
+            else:
+                head_dir[t+1] = move_dir[t+1] + look_angle
+
+            yaw[t+1] = math.fmod(head_dir[t+1] / np.pi * 180, 360)  # move yaw to end
+
+        move_dir = np.mod(move_dir + np.pi, 2*np.pi) - np.pi
+        head_dir = np.mod(head_dir + np.pi, 2*np.pi) - np.pi
+        ang_v = np.diff(move_dir, axis=-1)
+        head_ang_v = np.diff(head_dir, axis=-1)
+
+        return velocity[:num_samples], ang_v[:num_samples], head_ang_v[:num_samples], position[:num_samples], move_dir[:num_samples], head_dir[:num_samples], yaw[:num_samples]
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        # Initialize array with max sequence length
+        H, W, C = self.HWC
+        L = self.steps
+        if not (isinstance(H, int) and isinstance(W, int) and isinstance(C, int) and isinstance(L, int)):
+            return None
+        inputs = np.empty((L, H, W, C), dtype=np.uint8)
+ 
+        speed, ang_vel, head_ang_vel, position, move_dir, head_dir, yaw = self.generate_path()
+    
+        head_dir = np.expand_dims(head_dir, axis=-1)
+        state = np.concatenate((position, head_dir), axis=1)
+        actions = np.column_stack((speed, ang_vel, head_ang_vel))
+        
+        for idx in range(L):
+            def btoa(pixels):
+                return np.reshape(np.frombuffer(pixels, dtype=np.uint8), self.HWC)
+
+            new_x, new_z = position[idx]
+            new_yaw = math.fmod(yaw[idx], 360)
+            
+            self.agent_host.sendCommand(f"tp {new_x} 4.0 {new_z}")
+            self.agent_host.sendCommand(f"setYaw {new_yaw}")
+            
+            time.sleep(0.06)
+
+            self.expected_x = new_x
+            self.expected_y = 4.0
+            self.expected_z = new_z
+            self.expected_yaw = new_yaw
+            self.require_yaw_change = new_yaw != self.curr_yaw
+            self.require_move = new_x != self.curr_x or new_z != self.curr_z
+
+            self.prev_state, error = self.wait_next_state()
+            if error:
+                return None
+            
+            # Fill batch
+            if not self.prev_state.video_frames:
+                return None
+            pixels = self.prev_state.video_frames[-1].pixels
+
+            inputs[idx] = btoa(pixels).copy()
+        
+        return (inputs, actions, state)
+
+    def generate_dataset(self, path: Path, size=1000):
+        current_size = 0
+        with Progress() as progress:
+            task = progress.add_task("Building dataset...", total=size)
+            while current_size < size:
+                batch = self.__next__()
+                if batch is None:
+                    continue
+                inputs, actions, state = batch
+                current_path = path / f"{time.time()}"
+                os.makedirs(current_path, exist_ok=True)
+                for t in range(len(inputs)):
+                    image = ToPILImage()(inputs[t])
+                    image.save(current_path / f"{t}.png")
+                np.savez(current_path / "actions.npz", actions)
+                np.savez(current_path / "state.npz", state)
+
+                current_size += self.steps
+                progress.update(task, advance=self.steps)
+
+generator_random_uniform_hd.py:
+
+
+class EnvironmentGenerator(IterableDataset):
+    def __init__(
+        self, fn, port, batch_size=128, dataset_size=None, steps=50, tic_duration=0.008
+    ):
+        super().__init__()
+        self.tree = etree.parse(fn)
+        self.batch_size = batch_size
+        self.agent_host = MalmoPython.AgentHost()
+        self.dataset_size = dataset_size
+        self.current_samples = 0
+        self.steps = steps
+        self.tic_duration = tic_duration
+        self.tolerance = 0.001
+        self.render_tolerance = 0.2
+        self.border_region = 2 #25
+
+        # Load environment
+        self.env = MalmoPython.MissionSpec(etree.tostring(self.tree), True)
+
+        # Do not record anything
+        self.record = MalmoPython.MissionRecordSpec()
+
+        # Initialize client pool
+        pool = MalmoPython.ClientPool()
+        info = MalmoPython.ClientInfo("localhost", port)
+        pool.add(info)
+        experiment_id = str(uuid.uuid1())
+
+        # Initialize environment
+        self.agent_host.startMission(self.env, pool, self.record, 0, experiment_id)
+
+        # Loop until the mission starts
+        world_state = self.agent_host.getWorldState()
+        while not world_state.has_mission_begun:
+            time.sleep(0.1)
+            world_state = self.agent_host.getWorldState()
+
+        world_state = self.wait_initial_state()
+        frame = world_state.video_frames[-1]
+        self.HWC = (frame.height, frame.width, frame.channels)
+
+        self.start_time = time.time()
+
+    def init_pathfinding(self):
+        grid = [
+            block == "air"
+            for block in json.loads(self.prev_state.observations[-1].text)["board"]
+        ]
+        grid = ~np.array(grid).reshape((66, 41))
+        grid = np.flip(grid, axis=1)
+        #grid = dilation(grid) # need to think if you wanna do this at all
+        
+        self.grid = grid
+        
+        # Collect all of the positions of obstacles in the env
+        obstacle_locs = []
+        
+        for i in range(66):
+            for j in range(41):
+                if grid[i, j]:
+                    obstacle_locs.append((-j + 19.5, i - 29.5))
+
+        for z in [-30, 35]:
+            for x in range(-20, 20):
+                obstacle_locs.append((x, z))
+        
+        for x in [-20, 20]:
+            for z in range(-30, 35):
+                obstacle_locs.append((x, z))
+                
+        self.obstacle_locs = set(obstacle_locs)
+
+    
+    def get_nearest_obstacle(self, position):
+        '''
+        Find closest obstacle to the current position
+        '''
+        
+        min_dist = float('inf')
+        min_obst = None
+        for obst in self.obstacle_locs:
+            obst = np.array(obst, dtype=np.float32)
+            d = np.linalg.norm(position-obst)
+            if d < min_dist:
+                min_dist = d
+                min_obst = obst
+          
+        return min_obst, min_dist
+
+    
+    def avoids_obstacles(self, position, move_dir):
+        '''
+        Compute distance and angle to nearest obstacle/boundary
+        '''
+        x, z = position
+        
+        obst, d_obst = self.get_nearest_obstacle(position)
+        
+        def get_angle(x, z):
+            return np.arctan2(-x, z)
+        
+        a_obst = get_angle(obst[0] - x, obst[1] - z)
+        a_obst = np.mod(a_obst - move_dir + np.pi, 2*np.pi) - np.pi
+
+        return not (d_obst < self.border_region)*(np.abs(a_obst) < np.pi/2)
+
+    def generate_path(self):
+        num_samples = self.steps
+
+        # Find initial positions
+        position = np.zeros([num_samples + 2, 2], dtype=np.float32)
+        move_dir = np.zeros([num_samples + 2], dtype=np.float32)
+        head_dir = np.zeros([num_samples + 2], dtype=np.float32)
+        yaw = np.zeros([num_samples + 2], dtype=np.float32)
+        velocity = np.zeros([num_samples + 2], dtype=np.float32)
+
+        # Precompute constants
+        pi2 = 2 * np.pi
+        half_pi = np.pi / 2
+
+        while True:
+            if np.random.randint(0,10) < 8:
+                j, i = np.random.randint(0, 41), np.random.randint(0, 43)
+            else:
+                j, i = np.random.randint(0, 41), np.random.randint(57, 65)
+            z = i - 29.5
+            x = -j + 19.5
+            if not self.grid[i, j]:
+                position[0, 0] = x
+                position[0, 1] = z
+                break
+
+        move_dir[0] = np.random.uniform(0, pi2)#.astype(np.float32)
+        head_dir[0] = move_dir[0] + np.random.uniform(0, np.pi/4, 1).astype(np.float32)
+        yaw[0] = np.mod(head_dir[0] / np.pi * 180, 360)
+
+        for t in range(num_samples + 1):
+            tries = 0
+            while tries < 30:
+                vel = np.abs(np.random.uniform(0, 1))#.astype(np.float32)
+                new_dir = np.mod(move_dir[t] + np.random.uniform(0, pi2), pi2)#.astype(np.float32)
+
+                update = vel * np.array([-np.sin(new_dir), np.cos(new_dir)], dtype=np.float32)
+                new_pos = position[t] + update
+
+                obst, d_obst = self.get_nearest_obstacle(new_pos)
+                if d_obst > self.border_region:
+                    position[t + 1] = new_pos
+                    move_dir[t + 1] = new_dir
+                    velocity[t + 1] = vel
+                    hd = np.mod(move_dir[t] + np.random.uniform(0, pi2), pi2)
+                    head_dir[t + 1] = max(min(hd, move_dir[t+1] + np.pi/2), move_dir[t+1] - np.pi/2)
+                    yaw[t + 1] = np.mod(head_dir[t + 1] / np.pi * 180, 360)
+                    break
+                    
+                tries += 1
+            
+            if tries == 30:
+                print("stuck")
+                return None
+
+        ang_v = np.diff(move_dir)
+        head_ang_v = np.diff(head_dir)
+
+        return velocity[:num_samples], ang_v[:num_samples], head_ang_v[:num_samples], position[:num_samples], yaw[:num_samples]
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        # Initialize array with max sequence length
+
+        H, W, C = self.HWC
+        L = self.steps
+        inputs = np.empty((L, H, W, C), dtype=np.uint8)
+ 
+        path = self.generate_path()
+        if not path:
+            return None
+        
+        speed, ang_vel, head_ang_vel, position, yaw = path
+    
+        yaw = np.expand_dims(yaw, axis=-1)
+        state = np.concatenate((position, yaw), axis=1)
+        #print('first state', state[0])
+        actions = np.column_stack((speed, ang_vel, head_ang_vel))
+        #print('first action', actions[0])
+        
+        for idx in range(L):
+            def btoa(pixels):
+                return np.reshape(np.frombuffer(pixels, dtype=np.uint8), self.HWC)
+
+            new_x, new_z = position[idx]
+            new_yaw = math.fmod(yaw[idx], 360)
+            
+            self.agent_host.sendCommand(f"tp {new_x} 4.0 {new_z}")
+            self.agent_host.sendCommand(f"setYaw {new_yaw}")
+            
+            time.sleep(0.05)
+
+            self.expected_x = round(new_x, 3)
+            self.expected_y = 4.0
+            self.expected_z = round(new_z, 3)
+            self.expected_yaw = round(new_yaw,3)
+            self.require_yaw_change = new_yaw != self.curr_yaw
+            self.require_move = new_x != self.curr_x or new_z != self.curr_z
+
+            self.prev_state, error = self.wait_next_state()
+            if error:
+                return None
+            
+            time.sleep(0.05)
+            
+            # Fill batch
+            if not self.prev_state:
+                return None
+            if not self.prev_state.video_frames:
+                return None
+            pixels = self.prev_state.video_frames[-1].pixels
+
+            inputs[idx] = btoa(pixels).copy()
+        
+        #time.sleep(0.05)
+        return (inputs, actions, state)
+
+    def generate_dataset(self, path: Path, size=1000):
+        current_size = 0
+        with Progress() as progress:
+            task = progress.add_task("Building dataset...", total=size)
+            while current_size < size:
+                batch = self.__next__()
+                if batch is None:
+                    continue
+                inputs, actions, state = batch
+                current_path = path / f"{time.time()}"
+                os.makedirs(current_path, exist_ok=True)
+                for t in range(len(inputs)):
+                    image = ToPILImage()(inputs[t])
+                    image.save(current_path / f"{t}.png")
+                np.savez(current_path / "actions.npz", actions)
+                np.savez(current_path / "state.npz", state)
+
+                current_size += self.steps
+                progress.update(task, advance=self.steps)

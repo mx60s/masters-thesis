@@ -1,0 +1,11 @@
+config_version: biggest_world_r17_2d_predictive-coding-0.1-0.1-0.0_post_pred
+unity_env: biggest_world_r17
+model_name: predictive-coding-0.1-0.1-0.0
+output_layer: post_pred
+movement_mode: 2d
+n_rotations: 17
+env_x_min: -20
+env_x_max: 20
+env_y_min: -30
+env_y_max: 35
+multiplier: 1

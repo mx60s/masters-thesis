@@ -1,0 +1,11 @@
+config_version: small_world_r17_2d_predictive-coding-small-world-random_final
+unity_env: small_world_r17
+model_name: predictive-coding-small-world-random
+output_layer: final
+movement_mode: 2d
+n_rotations: 17
+env_x_min: 120 # used to be 112
+env_x_max: 136 # 135
+env_y_min: 197 # 197
+env_y_max: 213 # 221
+multiplier: 1
