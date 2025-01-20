@@ -1,4 +1,4 @@
-#From Sensory Input to Cognitive Maps: Exploring the Significance of Spatial Representations in Artificial Hippocampal Models
+# From Sensory Input to Cognitive Maps: Exploring the Significance of Spatial Representations in Artificial Hippocampal Models
 
 ## Table of contents
 
@@ -14,6 +14,7 @@
 This repo contains work that I did for my Master's thesis in Computer Science at UT Austin, under the supervision of Dr. Xue-Xin Wei and Dr. Risto Miikkulainen. 
 
 You can read the thesis here: [link](mvonebers.com/docs/thesis.pdf)
+
 I also wrote a [small article for Nature Machine Intelligence](https://www.nature.com/articles/s42256-024-00885-9) with my advisor about the work by Gornet and Thomson that this thesis is based on.
 
 This project investigates and critiques two recent models of hippocampal place cells and the cognitive maps that they are hypothesized to support. 
