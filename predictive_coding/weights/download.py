@@ -1,7 +1,7 @@
 import subprocess
 
 url_prefix = (
-    "https://s3.us-west-1.wasabisys.com/predictive-coding-thesis/weights/"
+    "https://thesis-github-files.s3.us-east-2.amazonaws.com/weights/"
 )
 with open("files.txt", "r") as f:
     for line in f:
